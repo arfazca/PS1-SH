@@ -362,7 +362,7 @@ Set-Alias cls clear
 function winfetch { & "$env:USERPROFILE\winfetch.ps1" @args }
 Set-Alias neofetch winfetch
 
-winfetch
+clear
 
 function prompt {
     $p = (Get-Location).Path.Replace($env:USERPROFILE, "~")
