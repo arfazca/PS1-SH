@@ -308,6 +308,52 @@ function find {
     if (-not $items) { Write-Host "  (no results)" -ForegroundColor DarkGray }
 }
 
+Remove-Item Alias:pwd -Force -ErrorAction SilentlyContinue
+function pwd {
+    $path = (Get-Location).Path
+    $parts = $path.Split('\')
+    Write-Host " " -NoNewline
+    $i = 0
+    foreach ($p in $parts) {
+        if ($p -eq '') {
+            Write-Host $parts[0] -NoNewline -ForegroundColor Cyan
+            break
+        }
+        if ($i -gt 0) { Write-Host " \" -NoNewline -ForegroundColor DarkGray }
+        Write-Host $p -NoNewline -ForegroundColor Cyan
+        $i++
+    }
+    Write-Host
+    $drive = [System.IO.Path]::GetPathRoot($path).TrimEnd('\')
+    $drv = Get-PSDrive -Name $drive.TrimEnd(':') -ErrorAction SilentlyContinue
+    if ($drv) {
+        $free = '{0:N1}G' -f ($drv.Free / 1GB)
+        $used = '{0:N1}G' -f (($drv.Used) / 1GB)
+        $total = '{0:N1}G' -f ($drv.Used / 1GB + $drv.Free / 1GB)
+        Write-Host "  " -NoNewline
+        Write-Host "disk" -NoNewline -ForegroundColor DarkGray
+        Write-Host " $free" -NoNewline -ForegroundColor Green
+        Write-Host " free of" -NoNewline -ForegroundColor DarkGray
+        Write-Host " $total" -NoNewline -ForegroundColor Yellow
+    }
+    $b = try { $(git rev-parse --abbrev-ref HEAD 2>$null) } catch { $null }
+    if ($b) {
+        $d = try { $(git status --porcelain 2>$null) } catch { $null }
+        $clr = if ($d) { 'Yellow' } else { 'Green' }
+        Write-Host "  " -NoNewline
+        Write-Host "git" -NoNewline -ForegroundColor DarkGray
+        Write-Host " $b" -NoNewline -ForegroundColor $clr
+    }
+    Write-Host
+    $items = Get-ChildItem -Force -ErrorAction SilentlyContinue
+    $dirs = ($items | Where-Object { $_.PSIsContainer }).Count
+    $files = ($items | Where-Object { -not $_.PSIsContainer }).Count
+    Write-Host "  " -NoNewline
+    Write-Host "items" -NoNewline -ForegroundColor DarkGray
+    Write-Host " $dirs dir(s)" -NoNewline -ForegroundColor Cyan
+    Write-Host ", $files file(s)" -ForegroundColor Gray
+}
+
 function winfetch { & "$env:USERPROFILE\winfetch.ps1" @args }
 Set-Alias neofetch winfetch
 
