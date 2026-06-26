@@ -316,10 +316,14 @@ winfetch
 function prompt {
     $p = (Get-Location).Path.Replace($env:USERPROFILE, "~")
     $b = try { $(git rev-parse --abbrev-ref HEAD 2>$null) } catch { $null }
+    $d = try { $(git status --porcelain 2>$null) } catch { $null }
+    $folder = Split-Path -Leaf (Get-Location)
+    $title = "$folder"
+    if ($b) { $title += " [$b]" }
+    $Host.UI.RawUI.WindowTitle = $title
     Write-Host "[" -NoNewline -ForegroundColor DarkGray
     Write-Host $p -NoNewline -ForegroundColor Cyan
     if ($b) {
-        $d = try { $(git status --porcelain 2>$null) } catch { $null }
         $clr = if ($d) { 'Yellow' } else { 'Green' }
         Write-Host " $b" -NoNewline -ForegroundColor $clr
     }
