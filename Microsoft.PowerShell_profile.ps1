@@ -354,6 +354,11 @@ function pwd {
     Write-Host ", $files file(s)" -ForegroundColor Gray
 }
 
+Remove-Item Alias:clear -Force -ErrorAction SilentlyContinue
+Remove-Item Alias:cls -Force -ErrorAction SilentlyContinue
+function clear { Clear-Host; winfetch }
+Set-Alias cls clear
+
 function winfetch { & "$env:USERPROFILE\winfetch.ps1" @args }
 Set-Alias neofetch winfetch
 
