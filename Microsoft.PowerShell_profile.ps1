@@ -1,4 +1,4 @@
-function treee {
+﻿function treee {
 	param(
 	    [string]$Path = ".",
 	    [int]$MaxDepth = 10,
@@ -101,7 +101,7 @@ function treee {
 	$output | Set-Clipboard
 	$output
 }
-. "C:\Users\AHussain\OneDrive - Megabyte Systems, Inc\Desktop\TFS to GIT\tree.ps1"
+. "C:\Users\AHussain\OneDrive - Megabyte Systems, Inc\Desktop\TFS to GIT\tree.ps1" 6>$null
 
 # Unix-to-PowerShell aliases
 Set-Alias grep    Select-String
@@ -306,4 +306,23 @@ function find {
         Write-Host "$(Resolve-Path -LiteralPath $i.FullName -Relative)" -ForegroundColor $c
     }
     if (-not $items) { Write-Host "  (no results)" -ForegroundColor DarkGray }
+}
+
+function winfetch { & "$env:USERPROFILE\winfetch.ps1" @args }
+Set-Alias neofetch winfetch
+
+winfetch
+
+function prompt {
+    $p = (Get-Location).Path.Replace($env:USERPROFILE, "~")
+    $b = try { $(git rev-parse --abbrev-ref HEAD 2>$null) } catch { $null }
+    Write-Host "[" -NoNewline -ForegroundColor DarkGray
+    Write-Host $p -NoNewline -ForegroundColor Cyan
+    if ($b) {
+        $d = try { $(git status --porcelain 2>$null) } catch { $null }
+        $clr = if ($d) { 'Yellow' } else { 'Green' }
+        Write-Host " $b" -NoNewline -ForegroundColor $clr
+    }
+    Write-Host "]" -NoNewline -ForegroundColor DarkGray
+    return "> "
 }
