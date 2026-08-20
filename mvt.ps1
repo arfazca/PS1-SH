@@ -1,7 +1,8 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 # ============================================================
 #  Megabyte Systems - Sign & Deploy Tool (mvt)
-#  Signs an executable using mst, then deploys to target folders
+#  Deploys an executable, waits for VICTL105 to sign it, then checks
+#  the signed copy in to TFS
 #  Self-installing: ensures it's on PATH every run
 # ============================================================
 
@@ -11,8 +12,8 @@ param(
 )
 
 $script:DepTabWidth = 4
-$script:TfExePath = "C:\Program Files (x86)\Microsoft Visual Studio\XXXX\Professional\Common7\IDE\CommonExtensions\Microsoft\TeamFoundation\Team Explorer\tf.exe"
-$script:TfScopeRoot = "C:\TFS\MPS XXXX\XXXX XXXX Development\XX. XXXXXXXXXXX"
+$script:TfExePath = "C:\Program Files (x86)\Microsoft Visual Studio\2017\Professional\Common7\IDE\CommonExtensions\Microsoft\TeamFoundation\Team Explorer\tf.exe"
+$script:TfScopeRoot = "C:\TFS\MPTS2015\MPTS 2015 Development\24. Executables"
 
 # ── Self-Install ─────────────────────────────────────────────
 $toolsDir = "$env:USERPROFILE\.megabyte-tools"
@@ -96,17 +97,16 @@ if (-not $ExePath) {
     Write-Host "    2. TFS Get Latest on 24. Executables" -ForegroundColor DarkGray
     Write-Host "    3. Checks for duplicate executables" -ForegroundColor DarkGray
     Write-Host "    4. (Optional) NuGet DLL workflow:" -ForegroundColor DarkGray
-    Write-Host "         - Scans csproj for NuGet-sourced DLL references" -ForegroundColor DarkGray
+    Write-Host "         - Scans csproj for NuGet-sourced DLL references (HintPath + PackageReference)" -ForegroundColor DarkGray
     Write-Host "         - Asks before adding DL rows to [Screen] Dependency.txt" -ForegroundColor DarkGray
     Write-Host "         - Copies DLLs to 24. Executables\DLL (per-DLL confirm)" -ForegroundColor DarkGray
     Write-Host "         - Copies DLLs to \\dev1\MPTS\Prod\BIN2015\libs (per-DLL confirm)" -ForegroundColor DarkGray
     Write-Host "         - WebView2 / System.Text.Json get version folders" -ForegroundColor DarkGray
-    Write-Host "    5. Sets clipboard to signing password" -ForegroundColor DarkGray
-    Write-Host "    6. Signs with mst" -ForegroundColor DarkGray
-    Write-Host "    7. Verifies signature" -ForegroundColor DarkGray
-    Write-Host "    8. Deploys to Executables + dev1 + dev3" -ForegroundColor DarkGray
-    Write-Host "    9. Queues TFS pending adds/deletes under 24. Executables" -ForegroundColor DarkGray
-    Write-Host "       (nothing is checked in - review in Team Explorer)" -ForegroundColor DarkGray
+    Write-Host "    5. Copies the unsigned exe to dev1 + dev3 right away" -ForegroundColor DarkGray
+    Write-Host "    6. Sends the exe to VICTL105 for signing" -ForegroundColor DarkGray
+    Write-Host "    7. Polls every 1 min until the VICTL105 copy is signed" -ForegroundColor DarkGray
+    Write-Host "    8. Re-copies the signed exe to dev1 + dev3 + local 24. Executables" -ForegroundColor DarkGray
+    Write-Host "    9. Checks that file in to TFS as '(NPT-630) Signed <name> by Arfaz'" -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  PROMPTS:" -ForegroundColor Yellow
     Write-Host "    Only y/yy/Y... or n/nn/N... are accepted." -ForegroundColor DarkGray
@@ -145,9 +145,10 @@ function Read-YesNo {
 
 function Invoke-TfOp {
     param(
-        [Parameter(Mandatory)][ValidateSet('add', 'delete')][string]$Operation,
+        [Parameter(Mandatory)][ValidateSet('add', 'delete', 'checkin')][string]$Operation,
         [Parameter(Mandatory)][string]$Path,
-        [switch]$Recursive
+        [switch]$Recursive,
+        [string]$Comment
     )
     $full = try { [IO.Path]::GetFullPath($Path) } catch { $Path }
     if (-not $full.StartsWith($script:TfScopeRoot, [StringComparison]::OrdinalIgnoreCase)) {
@@ -157,7 +158,9 @@ function Invoke-TfOp {
         Write-Warn "tf.exe not found; skipping 'tf $Operation' on $full"
         return $null
     }
-    $tfArgs = @($Operation, $full, '/noprompt')
+    $tfArgs = @($Operation, $full)
+    if ($Operation -eq 'checkin' -and $Comment) { $tfArgs += "/comment:$Comment" }
+    $tfArgs += '/noprompt'
     if ($Recursive) { $tfArgs += '/recursive' }
     $out = & $script:TfExePath @tfArgs 2>&1
     return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $out }
@@ -203,8 +206,10 @@ function Get-NuGetRefs {
     try { [xml]$x = Get-Content $CsprojPath -Raw } catch { return $out.ToArray() }
     $ns = New-Object System.Xml.XmlNamespaceManager($x.NameTable)
     $ns.AddNamespace("m", "http://schemas.microsoft.com/developer/msbuild/2003")
-    $refs = $x.SelectNodes("//m:Reference[m:HintPath]", $ns)
     $csprojDir = Split-Path $CsprojPath -Parent
+
+    # Classic (packages-folder) References — HintPath pointing into packages\
+    $refs = $x.SelectNodes("//m:Reference[m:HintPath]", $ns)
     foreach ($r in $refs) {
         $hp = $r.SelectSingleNode("m:HintPath", $ns).InnerText
         if ($hp -notmatch '(^|\\)packages\\') { continue }
@@ -221,6 +226,79 @@ function Get-NuGetRefs {
         }
         catch { }
     }
+
+    # SDK-style PackageReference — resolve DLLs from the NuGet global cache.
+    # Uses "//m:PackageReference" for classic csproj with MSBuild namespace,
+    # and "//PackageReference" for SDK-style csproj (no default namespace).
+    $pkgRefNodes = [System.Collections.Generic.List[System.Xml.XmlNode]]::new()
+    foreach ($node in $x.SelectNodes("//m:PackageReference", $ns)) { $pkgRefNodes.Add($node) }
+    $seenIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($node in $pkgRefNodes) { [void]$seenIds.Add($node.GetAttribute("Include")) }
+    foreach ($node in $x.SelectNodes("//PackageReference")) {
+        if ($seenIds.Add($node.GetAttribute("Include"))) { $pkgRefNodes.Add($node) }
+    }
+
+    if ($pkgRefNodes.Count -gt 0) {
+        $nugetCache = if ($env:NUGET_PACKAGES) { $env:NUGET_PACKAGES }
+                      else { Join-Path $env:USERPROFILE ".nuget\packages" }
+
+        # Determine the project's target framework for TFM folder selection.
+        $projTfm = ""
+        $tfwNode = $x.SelectSingleNode("//m:TargetFrameworkVersion", $ns)
+        if (-not $tfwNode) { $tfwNode = $x.SelectSingleNode("//TargetFrameworkVersion") }
+        if ($tfwNode) {
+            # v4.8 -> net48
+            $projTfm = "net" + ($tfwNode.InnerText -replace '^v', '' -replace '\.', '')
+        } else {
+            $tfNode = $x.SelectSingleNode("//m:TargetFramework", $ns)
+            if (-not $tfNode) { $tfNode = $x.SelectSingleNode("//TargetFramework") }
+            if ($tfNode) { $projTfm = ($tfNode.InnerText.Trim() -split ';')[0] }
+        }
+
+        # TFM preference order: project TFM first, then common .NET Framework TFMs.
+        $tfmPriority = @()
+        if ($projTfm) { $tfmPriority += $projTfm }
+        $tfmPriority += @("net48","net472","net471","net47","net462","net461","net46","net452","net451","net45","net40","netstandard2.0","netstandard1.6","netstandard1.0")
+
+        foreach ($pr in $pkgRefNodes) {
+            $pkgId  = $pr.GetAttribute("Include")
+            $pkgVer = $pr.GetAttribute("Version")
+            if (-not $pkgId -or -not $pkgVer) { continue }
+
+            $pkgVerDir = Join-Path $nugetCache (Join-Path ($pkgId.ToLower()) $pkgVer)
+            if (-not (Test-Path $pkgVerDir)) { continue }
+
+            $libDir = Join-Path $pkgVerDir "lib"
+            if (-not (Test-Path $libDir)) { continue }
+
+            # Pick the best matching TFM folder.
+            $chosenDir = $null
+            foreach ($t in $tfmPriority) {
+                $d = Join-Path $libDir $t
+                if (Test-Path $d) { $chosenDir = $d; break }
+            }
+            if (-not $chosenDir) {
+                # Fall back to the alphabetically last TFM dir (usually highest version).
+                $dirs = Get-ChildItem $libDir -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending
+                if ($dirs) { $chosenDir = $dirs[0].FullName }
+            }
+            if (-not $chosenDir) { continue }
+
+            foreach ($dll in (Get-ChildItem $chosenDir -Filter "*.dll" -File -ErrorAction SilentlyContinue)) {
+                if ($out | Where-Object { $_.Name -eq $dll.BaseName }) { continue }
+                try {
+                    $an = [Reflection.AssemblyName]::GetAssemblyName($dll.FullName)
+                    $out.Add([pscustomobject]@{
+                        Name       = $dll.BaseName
+                        Version    = $an.Version.ToString()
+                        FileName   = $dll.Name
+                        SourcePath = $dll.FullName
+                    })
+                } catch { }
+            }
+        }
+    }
+
     return ($out | Sort-Object Name, Version -Unique)
 }
 
@@ -400,6 +478,8 @@ Write-Host ""
 $execSubfolder = $exeName.Substring(0, 2).ToUpper()
 $executables24Path = "C:\TFS\MPTS2015\MPTS 2015 Development\24. Executables\$execSubfolder"
 $executables24Root = "C:\TFS\MPTS2015\MPTS 2015 Development\24. Executables"
+$victlSigningRoot = "\\VICTL105\Signing\MPTS 2015 Development\24. Executables"
+$victlSigningPath = "$victlSigningRoot\$execSubfolder"
 
 Write-Step "TFS Get Latest on 24. Executables..."
 if (Test-Path $script:TfExePath) {
@@ -593,12 +673,29 @@ if ($doDlls) {
         Write-Host ""
         Publish-DllsToRoot -RootLabel "TFS DLL folder" -Root $tfsDllRoot -Dlls $dlls
         Write-Host ""
-        Write-Step "Queueing TFS pending adds under DLL root..."
-        $addRes = Invoke-TfOp -Operation 'add' -Path $tfsDllRoot -Recursive
-        if ($addRes) {
-            if ($addRes.ExitCode -eq 0) { Write-Ok "tf add /recursive completed on $tfsDllRoot" }
-            else { Write-Warn "tf add returned exit $($addRes.ExitCode). Review pending changes manually." }
+        Write-Step "Queueing TFS pending adds for new DLL files..."
+        $tfAddOk = 0; $tfAddFail = 0
+        foreach ($d in $dlls) {
+            $target = Get-DllTargetPath -Root $tfsDllRoot -Dll $d
+            if (-not (Test-Path $target)) { continue }
+            $res = Invoke-TfOp -Operation 'add' -Path $target
+            if ($res) {
+                if ($res.ExitCode -eq 0) { Write-Ok "tf add: $target"; $tfAddOk++ }
+                else {
+                    # Already tracked (exit 1 with "no items match" or "already under TF") is OK — not a real failure.
+                    $msg = ($res.Output -join " ").Trim()
+                    if ($msg -match 'no items match|already under|cannot add' ) {
+                        Write-Host "  [SKIP] Already tracked: $(Split-Path $target -Leaf)" -ForegroundColor DarkGray
+                    } else {
+                        Write-Warn "tf add failed for $target : $msg"
+                        $tfAddFail++
+                    }
+                }
+            }
         }
+        if ($tfAddFail -gt 0) { Write-Warn "$tfAddFail tf add(s) failed — review pending changes in Team Explorer." }
+        elseif ($tfAddOk -gt 0) { Write-Ok "$tfAddOk new DLL file(s) queued for add in TFS." }
+        else { Write-Host "  All DLL files already tracked in TFS." -ForegroundColor DarkGray }
         Write-Host ""
         Publish-DllsToRoot -RootLabel "dev1 libs" -Root $libsRoot -Dlls $dlls
         Write-Host ""
@@ -609,7 +706,8 @@ Write-Host "  +-------------------------------------------------+" -ForegroundCo
 Write-Host "  |  DEPLOYMENT DESTINATIONS                        |" -ForegroundColor Cyan
 Write-Host "  +-------------------------------------------------+" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "  1. $executables24Path" -ForegroundColor White
+Write-Host "  1. $victlSigningPath" -ForegroundColor White
+Write-Host "     (signs in ~3-5 min, then checked in to $executables24Path)" -ForegroundColor DarkGray
 Write-Host "  2. \\dev1\MPTS\Prod\BIN2015" -ForegroundColor White
 Write-Host "  3. \\dev3\MPTS\Prod\BIN2015" -ForegroundColor White
 Write-Host ""
@@ -619,166 +717,120 @@ if (-not (Read-YesNo "  Proceed with these destinations? (Y/N)")) {
 }
 Write-Host ""
 
-# ── Signing capability pre-flight ─────────────────────────────
-$signingCertThumbprint = "755A2922C77AE58CE16D2358332000B894EF52B6"
-$signToolExe = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe"
-$signed = $false
-$signingSkipped = $false
-$skipReasons = @()
-
-if (-not (Get-Command mst -ErrorAction SilentlyContinue)) {
-    $skipReasons += "mst tool not found on PATH (megabytesystems.signtool not installed)"
-}
-
-if (-not (Test-Path $signToolExe)) {
-    $kitsBase = "C:\Program Files (x86)\Windows Kits\10\bin"
-    $altSigntool = $null
-    if (Test-Path $kitsBase) {
-        $altSigntool = Get-ChildItem -Path $kitsBase -Filter signtool.exe -Recurse -ErrorAction SilentlyContinue |
-        Where-Object { $_.FullName -like "*\x64\*" } |
-        Sort-Object FullName -Descending | Select-Object -First 1
+function Copy-ExeToDestination {
+    param([string]$Dest, [string]$Source, [string]$FileName)
+    if (-not (Test-Path $Dest)) {
+        Write-Warn "Destination folder does not exist. Creating: $Dest"
+        try { New-Item -ItemType Directory -Path $Dest -Force | Out-Null }
+        catch { Write-Err "Could not create folder: $($_.Exception.Message)"; return $false }
     }
-    if ($altSigntool) {
-        $signToolExe = $altSigntool.FullName
+    try {
+        Copy-Item -Path $Source -Destination (Join-Path $Dest $FileName) -Force
+        Write-Ok "Copied to $(Join-Path $Dest $FileName)"
+        return $true
     }
-    else {
-        $skipReasons += "signtool.exe not found under Windows Kits"
+    catch {
+        Write-Err "Failed to copy to ${Dest}: $($_.Exception.Message)"
+        return $false
     }
 }
 
-try {
-    $cert = Get-ChildItem -Path Cert:\CurrentUser\My -ErrorAction SilentlyContinue |
-    Where-Object { $_.Thumbprint -eq $signingCertThumbprint }
-    if (-not $cert) {
-        $cert = Get-ChildItem -Path Cert:\LocalMachine\My -ErrorAction SilentlyContinue |
-        Where-Object { $_.Thumbprint -eq $signingCertThumbprint }
-    }
-    if (-not $cert) {
-        $skipReasons += "Signing certificate $signingCertThumbprint not in cert store (USB token not inserted?)"
-    }
-}
-catch {
-    $skipReasons += "Could not query certificate store: $($_.Exception.Message)"
-}
-
-if ($skipReasons.Count -gt 0) {
-    $signingSkipped = $true
-    Write-Host ""
-    Write-Host "  +-------------------------------------------------+" -ForegroundColor Red
-    Write-Host "  |  SIGNING SKIPPED - this machine cannot sign     |" -ForegroundColor Red
-    Write-Host "  +-------------------------------------------------+" -ForegroundColor Red
-    foreach ($r in $skipReasons) {
-        Write-Host "    - $r" -ForegroundColor Red
-    }
-    Write-Host "  Continuing with deployment WITHOUT signing." -ForegroundColor Red
-    Write-Host ""
-}
-else {
-    Write-Step "Setting clipboard to signing password..."
-    Set-Clipboard -Value "################"
-    Write-Ok "Clipboard ready."
-    Write-Host ""
-    Write-Step "Signing $exeFile with mst..."
-    Write-Host ""
-    $mstProcess = Start-Process -FilePath "mst" `
-        -ArgumentList "-exe `"$ExePath`"" `
-        -NoNewWindow `
-        -Wait `
-        -PassThru
-    Write-Host ""
-    if ($mstProcess.ExitCode -ne 0) {
-        Write-Err "mst exited with code $($mstProcess.ExitCode)."
-        Write-Host ""
-        if (-not (Read-YesNo "  mst may have failed. Continue with deployment anyway? (Y/N)")) {
-            Write-Warn "Aborted by user."
-            exit 1
-        }
-    }
-
-    Write-Step "Verifying signature on $exeFile..."
-    $verifyResult = & $signToolExe verify /pa "$ExePath" 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        Write-Ok "Signature verified successfully."
-        $signed = $true
-    }
-    else {
-        Write-Warn "Signature verification failed."
-        Write-Host "  $($verifyResult -join "`n  ")" -ForegroundColor DarkGray
-        Write-Host ""
-        if (-not (Read-YesNo "  Continue with deployment anyway? (Y/N)")) {
-            Write-Warn "Aborted by user."
-            exit 1
-        }
-    }
-    Write-Host ""
-}
-
-$destinations = @(
-    $executables24Path,
+$devDestinations = @(
     "\\dev1\MPTS\Prod\BIN2015",
     "\\dev3\MPTS\Prod\BIN2015"
 )
-$copySuccess = 0
-$copyFail = 0
-$deployedPaths = @()
 
-foreach ($dest in $destinations) {
-    Write-Step "Copying to: $dest"
-    if (-not (Test-Path $dest)) {
-        Write-Warn "Destination folder does not exist. Creating: $dest"
-        try {
-            New-Item -ItemType Directory -Path $dest -Force | Out-Null
-        }
-        catch {
-            Write-Err "Could not create folder: $($_.Exception.Message)"
-            $copyFail++
-            continue
-        }
+Write-Step "Copying unsigned $exeFile to dev1 + dev3..."
+foreach ($dest in $devDestinations) { Copy-ExeToDestination -Dest $dest -Source $ExePath -FileName $exeFile | Out-Null }
+Write-Host ""
+
+Write-Step "Sending $exeFile to VICTL105 for signing..."
+if (-not (Test-Path $victlSigningPath)) {
+    try { New-Item -ItemType Directory -Path $victlSigningPath -Force | Out-Null }
+    catch { Write-Err "Could not create folder: $($_.Exception.Message)"; exit 1 }
+}
+$victlFilePath = Join-Path $victlSigningPath $exeFile
+try {
+    Copy-Item -Path $ExePath -Destination $victlFilePath -Force
+    Write-Ok "Sent to $victlFilePath"
+}
+catch {
+    Write-Err "Failed to send to VICTL105: $($_.Exception.Message)"
+    exit 1
+}
+Write-Host ""
+
+# ── Poll VICTL105 until the copy is signed ─────────────────────
+Write-Step "Waiting for VICTL105 to sign $exeFile (checking every 1 min)..."
+$maxWaitMinutes = 15
+$waitedMinutes = 0
+$signed = $false
+while (-not $signed) {
+    Start-Sleep -Seconds 60
+    $waitedMinutes++
+    $sig = Get-AuthenticodeSignature -FilePath $victlFilePath -ErrorAction SilentlyContinue
+    if ($sig -and $sig.Status -eq 'Valid') {
+        $signed = $true
+        Write-Ok "Signed after ~$waitedMinutes min."
+        break
     }
-    try {
-        $destFile = Join-Path $dest $exeFile
-        Copy-Item -Path $ExePath -Destination $destFile -Force
-        Write-Ok "Copied to $destFile"
-        $deployedPaths += $destFile
-        $copySuccess++
-    }
-    catch {
-        Write-Err "Failed to copy: $($_.Exception.Message)"
-        $copyFail++
+    Write-Host "    ... still unsigned after $waitedMinutes min" -ForegroundColor DarkGray
+    if ($waitedMinutes -ge $maxWaitMinutes) {
+        Write-Warn "Still unsigned after $maxWaitMinutes min."
+        if (-not (Read-YesNo "  Keep waiting? (Y/N)")) {
+            Write-Warn "Aborted by user - copies at dev1/dev3/VICTL105 remain UNSIGNED. Nothing checked in."
+            exit 1
+        }
+        $waitedMinutes = 0
     }
 }
-
 Write-Host ""
-Write-Step "Queueing TFS pending adds under $executables24Path..."
-$addRes = Invoke-TfOp -Operation 'add' -Path $executables24Path -Recursive
-if ($addRes) {
-    if ($addRes.ExitCode -eq 0) { Write-Ok "tf add /recursive completed on $executables24Path" }
-    else { Write-Warn "tf add returned exit $($addRes.ExitCode). Review pending changes manually." }
+
+# ── Re-deploy the signed copy and check it in to TFS ────────────
+Write-Step "Re-copying signed $exeFile to dev1 + dev3..."
+foreach ($dest in $devDestinations) { Copy-ExeToDestination -Dest $dest -Source $victlFilePath -FileName $exeFile | Out-Null }
+Write-Host ""
+
+Write-Step "Copying signed $exeFile to local TFS workspace: $executables24Path"
+$localCopyOk = Copy-ExeToDestination -Dest $executables24Path -Source $victlFilePath -FileName $exeFile
+Write-Host ""
+
+$localTfsPath = Join-Path $executables24Path $exeFile
+$objLabel = if ([IO.Path]::GetExtension($exeFile) -ieq ".dll") { "DLL $exeName" } else { $exeName }
+$checkinComment = "(NPT-630) Signed $objLabel by Arfaz"
+$checkinOk = $false
+
+if (-not $localCopyOk) {
+    Write-Err "Signed copy to $localTfsPath failed - skipping TFS checkin. Copy it manually, then check in yourself."
 }
-
+else {
+    Write-Step "Checking in $exeFile to TFS..."
+    Invoke-TfOp -Operation 'add' -Path $localTfsPath | Out-Null
+    $checkinRes = Invoke-TfOp -Operation 'checkin' -Path $localTfsPath -Comment $checkinComment
+    $checkinOk = $checkinRes -and $checkinRes.ExitCode -eq 0
+    if ($checkinOk) {
+        Write-Ok "Checked in: $localTfsPath"
+    }
+    else {
+        Write-Warn "tf checkin did not report success - review manually in Team Explorer."
+        if ($checkinRes) { Write-Host "  $($checkinRes.Output -join "`n  ")" -ForegroundColor DarkGray }
+    }
+}
 Write-Host ""
+
 Write-Host "  +-------------------------------------------------+" -ForegroundColor Cyan
 Write-Host "  |  SUMMARY                                        |" -ForegroundColor Cyan
 Write-Host "  +-------------------------------------------------+" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "  Executable  : $exeFile" -ForegroundColor White
-$signedLabel = if ($signed) { 'Yes' } elseif ($signingSkipped) { 'No (skipped - no signing capability)' } else { 'Unverified' }
-$signedColor = if ($signed) { 'Green' } elseif ($signingSkipped) { 'Red' } else { 'Yellow' }
-Write-Host "  Signed      : $signedLabel" -ForegroundColor $signedColor
-Write-Host "  Copies OK   : $copySuccess / $($destinations.Count)" -ForegroundColor $(if ($copyFail -eq 0) { 'Green' } else { 'Yellow' })
-
-if ($copyFail -gt 0) {
-    Write-Host "  Copies FAIL : $copyFail" -ForegroundColor Red
+Write-Host "  Signed      : Yes" -ForegroundColor Green
+Write-Host "  Checked in  : $checkinComment" -ForegroundColor $(if ($checkinOk) { 'Green' } else { 'Yellow' })
+Write-Host ""
+Write-Host "  DEPLOYED TO:" -ForegroundColor Red
+Write-Host "    $localTfsPath" -ForegroundColor Red
+foreach ($dest in $devDestinations) {
+    Write-Host "    $(Join-Path $dest $exeFile)" -ForegroundColor Red
 }
-
-if ($deployedPaths.Count -gt 0) {
-    Write-Host ""
-    Write-Host "  DEPLOYED TO:" -ForegroundColor Red
-    foreach ($dp in $deployedPaths) {
-        Write-Host "    $dp" -ForegroundColor Red
-    }
-}
-
 Write-Host ""
 Write-Host "  Done!" -ForegroundColor Green
 Write-Host ""
