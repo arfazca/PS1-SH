@@ -5,6 +5,10 @@
 #  the signed copy in to TFS
 #  Self-installing: ensures it's on PATH every run
 # ============================================================
+# AGENT NOTE: for unattended/scripted runs, drive this file through
+# run_mvt.ps1 (pwsh, not powershell.exe) instead of piping answers into
+# this script directly.
+# ============================================================
 
 param(
     [Parameter(Position = 0, Mandatory = $false)]
@@ -106,7 +110,7 @@ if (-not $ExePath) {
     Write-Host "    6. Sends the exe to VICTL105 for signing" -ForegroundColor DarkGray
     Write-Host "    7. Polls every 1 min until the VICTL105 copy is signed" -ForegroundColor DarkGray
     Write-Host "    8. Re-copies the signed exe to dev1 + dev3 + local 24. Executables" -ForegroundColor DarkGray
-    Write-Host "    9. Checks that file in to TFS as '(NPT-630) Signed <name> by Arfaz'" -ForegroundColor DarkGray
+    Write-Host "    9. Checks that file in to TFS as '(NPT-630) Signed <name>'" -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  PROMPTS:" -ForegroundColor Yellow
     Write-Host "    Only y/yy/Y... or n/nn/N... are accepted." -ForegroundColor DarkGray
@@ -143,9 +147,26 @@ function Read-YesNo {
     }
 }
 
+function Invoke-TfSerialized {
+    param([scriptblock]$Action)
+    $mutex = New-Object Threading.Mutex($false, "Global\MegabyteTfsWorkspaceLock")
+    $acquired = $false
+    try {
+        $acquired = $mutex.WaitOne([TimeSpan]::FromMinutes(10))
+        if (-not $acquired) {
+            Write-Warn "Timed out waiting for another mvt's tf.exe operation to finish; proceeding anyway."
+        }
+        & $Action
+    }
+    finally {
+        if ($acquired) { $mutex.ReleaseMutex() }
+        $mutex.Dispose()
+    }
+}
+
 function Invoke-TfOp {
     param(
-        [Parameter(Mandatory)][ValidateSet('add', 'delete', 'checkin')][string]$Operation,
+        [Parameter(Mandatory)][ValidateSet('add', 'edit', 'delete', 'checkin')][string]$Operation,
         [Parameter(Mandatory)][string]$Path,
         [switch]$Recursive,
         [string]$Comment
@@ -162,8 +183,10 @@ function Invoke-TfOp {
     if ($Operation -eq 'checkin' -and $Comment) { $tfArgs += "/comment:$Comment" }
     $tfArgs += '/noprompt'
     if ($Recursive) { $tfArgs += '/recursive' }
-    $out = & $script:TfExePath @tfArgs 2>&1
-    return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $out }
+    return Invoke-TfSerialized {
+        $out = & $script:TfExePath @tfArgs 2>&1
+        [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $out }
+    }
 }
 
 # ── Dependency / NuGet Helpers ───────────────────────────────
@@ -483,18 +506,22 @@ $victlSigningPath = "$victlSigningRoot\$execSubfolder"
 
 Write-Step "TFS Get Latest on 24. Executables..."
 if (Test-Path $script:TfExePath) {
+    $tfsOutFile = "$env:TEMP\mvt_tfs_out_$PID.txt"
+    $tfsErrFile = "$env:TEMP\mvt_tfs_err_$PID.txt"
     try {
-        $tfsProcess = Start-Process -FilePath $script:TfExePath `
-            -ArgumentList "get `"$executables24Root`" /recursive /force" `
-            -NoNewWindow `
-            -Wait `
-            -PassThru `
-            -RedirectStandardOutput "$env:TEMP\mvt_tfs_out.txt" `
-            -RedirectStandardError "$env:TEMP\mvt_tfs_err.txt"
-        $tfsOut = Get-Content "$env:TEMP\mvt_tfs_out.txt" -Raw -ErrorAction SilentlyContinue
-        $tfsErr = Get-Content "$env:TEMP\mvt_tfs_err.txt" -Raw -ErrorAction SilentlyContinue
-        Remove-Item "$env:TEMP\mvt_tfs_out.txt", "$env:TEMP\mvt_tfs_err.txt" -Force -ErrorAction SilentlyContinue
-        $tfsAll = "$tfsOut $tfsErr"        
+        Invoke-TfSerialized {
+            $script:tfsProcess = Start-Process -FilePath $script:TfExePath `
+                -ArgumentList "get `"$executables24Root`" /recursive /force" `
+                -NoNewWindow `
+                -Wait `
+                -PassThru `
+                -RedirectStandardOutput $tfsOutFile `
+                -RedirectStandardError $tfsErrFile
+        }
+        $tfsOut = Get-Content $tfsOutFile -Raw -ErrorAction SilentlyContinue
+        $tfsErr = Get-Content $tfsErrFile -Raw -ErrorAction SilentlyContinue
+        Remove-Item $tfsOutFile, $tfsErrFile -Force -ErrorAction SilentlyContinue
+        $tfsAll = "$tfsOut $tfsErr"
         if ($tfsProcess.ExitCode -eq 0) {
             Write-Ok "TFS Get Latest completed."
         }
@@ -761,27 +788,33 @@ catch {
 Write-Host ""
 
 # ── Poll VICTL105 until the copy is signed ─────────────────────
-Write-Step "Waiting for VICTL105 to sign $exeFile (checking every 1 min)..."
-$maxWaitMinutes = 15
-$waitedMinutes = 0
+Write-Step "Waiting for VICTL105 to sign $exeFile (checking every 1 sec)..."
+$maxWaitSeconds = 15 * 60
+$waitedSeconds = 0
+$lastStatusAtSeconds = 0
+$statusEverySeconds = 10
 $signed = $false
 while (-not $signed) {
-    Start-Sleep -Seconds 60
-    $waitedMinutes++
+    Start-Sleep -Seconds 1
+    $waitedSeconds++
     $sig = Get-AuthenticodeSignature -FilePath $victlFilePath -ErrorAction SilentlyContinue
     if ($sig -and $sig.Status -eq 'Valid') {
         $signed = $true
-        Write-Ok "Signed after ~$waitedMinutes min."
+        Write-Ok "Signed after ~$waitedSeconds sec."
         break
     }
-    Write-Host "    ... still unsigned after $waitedMinutes min" -ForegroundColor DarkGray
-    if ($waitedMinutes -ge $maxWaitMinutes) {
-        Write-Warn "Still unsigned after $maxWaitMinutes min."
+    if ($waitedSeconds - $lastStatusAtSeconds -ge $statusEverySeconds) {
+        Write-Host "    ... still unsigned after $waitedSeconds sec" -ForegroundColor DarkGray
+        $lastStatusAtSeconds = $waitedSeconds
+    }
+    if ($waitedSeconds -ge $maxWaitSeconds) {
+        Write-Warn "Still unsigned after $([Math]::Round($maxWaitSeconds / 60)) min."
         if (-not (Read-YesNo "  Keep waiting? (Y/N)")) {
             Write-Warn "Aborted by user - copies at dev1/dev3/VICTL105 remain UNSIGNED. Nothing checked in."
             exit 1
         }
-        $waitedMinutes = 0
+        $waitedSeconds = 0
+        $lastStatusAtSeconds = 0
     }
 }
 Write-Host ""
@@ -797,7 +830,7 @@ Write-Host ""
 
 $localTfsPath = Join-Path $executables24Path $exeFile
 $objLabel = if ([IO.Path]::GetExtension($exeFile) -ieq ".dll") { "DLL $exeName" } else { $exeName }
-$checkinComment = "(NPT-630) Signed $objLabel by Arfaz"
+$checkinComment = "(NPT-630) Signed $objLabel"
 $checkinOk = $false
 
 if (-not $localCopyOk) {
@@ -805,7 +838,13 @@ if (-not $localCopyOk) {
 }
 else {
     Write-Step "Checking in $exeFile to TFS..."
-    Invoke-TfOp -Operation 'add' -Path $localTfsPath | Out-Null
+    # Existing tracked files need an explicit checkout/edit before TFS will register the
+    # overwritten content as a pending change (server workspaces don't auto-detect writes).
+    # Only fall back to 'add' when the file isn't under source control yet.
+    $editRes = Invoke-TfOp -Operation 'edit' -Path $localTfsPath
+    if (-not $editRes -or $editRes.ExitCode -ne 0) {
+        Invoke-TfOp -Operation 'add' -Path $localTfsPath | Out-Null
+    }
     $checkinRes = Invoke-TfOp -Operation 'checkin' -Path $localTfsPath -Comment $checkinComment
     $checkinOk = $checkinRes -and $checkinRes.ExitCode -eq 0
     if ($checkinOk) {
