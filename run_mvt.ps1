@@ -28,28 +28,17 @@ $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$Script`" `"$Exe`""
 $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
 $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
 $p = [Diagnostics.Process]::Start($psi)
-$sb = New-Object Text.StringBuilder
+$p.StandardInput.Close()
 $out = $p.StandardOutput; $buf = New-Object char[] 4096
 $task = $out.ReadAsync($buf, 0, 4096)
 $deadline = [DateTime]::UtcNow.AddMinutes($MaxMinutes)
-$answeredAt = 0
 "START $Exe $(Get-Date)" | Set-Content $Log
 while (-not $p.HasExited -and [DateTime]::UtcNow -lt $deadline) {
   if ($task.Wait(1000)) {
     $n = $task.Result
     if ($n -le 0) { break }
-    [void]$sb.Append($buf, 0, $n); Add-Content $Log (New-Object string($buf, 0, $n)) -NoNewline
+    Add-Content $Log (New-Object string($buf, 0, $n)) -NoNewline
     $task = $out.ReadAsync($buf, 0, 4096)
-  }
-  $t = $sb.ToString()
-  if ($t.Length -gt $answeredAt) {
-    $tail = $t.Substring($answeredAt)
-    if ($tail -match '\(Y/N\)\s*:?\s*$') {
-      $line = ($tail -split "`n")[-1]
-      Add-Content $Log "`n<<< PROMPT: $($line.Trim())  ->  y >>>`n"
-      $p.StandardInput.WriteLine('y'); $p.StandardInput.Flush()
-      $answeredAt = $t.Length
-    }
   }
 }
 if (-not $p.HasExited) { Add-Content $Log "`nTIMEOUT - stopping mvt"; Stop-Process -Id $p.Id -Force }

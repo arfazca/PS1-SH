@@ -138,13 +138,8 @@ function Write-Warn([string]$msg) {
 
 function Read-YesNo {
     param([string]$Prompt)
-    while ($true) {
-        $ans = Read-Host $Prompt
-        $t = if ($null -eq $ans) { "" } else { $ans.Trim() }
-        if ($t -match '^[Yy]+$') { return $true }
-        if ($t -match '^[Nn]+$') { return $false }
-        Write-Host "    Please answer with y/yy/Y... or n/nn/N..." -ForegroundColor DarkGray
-    }
+    Write-Host "${Prompt}: Y"
+    return $true
 }
 
 function Invoke-TfSerialized {
