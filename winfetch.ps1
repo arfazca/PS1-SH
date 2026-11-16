@@ -289,8 +289,8 @@ foreach ($param in $PSBoundParameters.Keys) {
 # ===== VARIABLES =====
 $e = [char]0x1B
 $ansiRegex = '([\u001B\u009B][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[-a-zA-Z\d\/#&.:=?%@~_]*)*)?\u0007)|(?:(?:\d{1,4}(?:;\d{0,4})*)?[\dA-PR-TZcf-ntqry=><~])))'
-# patched: DCOM instead of a WSMan CIM session (387ms -> 26ms on this box)
-$os = Get-CimInstance -ClassName Win32_OperatingSystem -Property Caption,OSArchitecture,LastBootUpTime,TotalVisibleMemorySize,FreePhysicalMemory
+$cimSession = New-CimSession
+$os = Get-CimInstance -ClassName Win32_OperatingSystem -Property Caption,OSArchitecture,LastBootUpTime,TotalVisibleMemorySize,FreePhysicalMemory -CimSession $cimSession
 $t = if ($blink) { "5" } else { "1" }
 $COLUMNS = $imgwidth
 
@@ -578,7 +578,7 @@ function info_os {
 
 # ===== MOTHERBOARD =====
 function info_motherboard {
-    $motherboard = Get-CimInstance Win32_BaseBoard -Property Manufacturer,Product
+    $motherboard = Get-CimInstance Win32_BaseBoard -CimSession $cimSession -Property Manufacturer,Product
     return @{
         title = "Motherboard"
         content = "{0} {1}" -f $motherboard.Manufacturer, $motherboard.Product
@@ -607,7 +607,7 @@ function info_dashes {
 
 # ===== COMPUTER =====
 function info_computer {
-    $compsys = Get-CimInstance -ClassName Win32_ComputerSystem -Property Manufacturer,Model
+    $compsys = Get-CimInstance -ClassName Win32_ComputerSystem -Property Manufacturer,Model -CimSession $cimSession
     return @{
         title   = "Host"
         content = '{0} {1}' -f $compsys.Manufacturer, $compsys.Model
@@ -657,17 +657,17 @@ function info_resolution {
 # ===== TERMINAL =====
 # this section works by getting the parent processes of the current powershell instance.
 function info_terminal {
-    # patched: env vars answer this instantly; the process walk below costs a
-    # CIM query per hop (~200ms each) and this box's chain is four deep.
+    # patched: env vars answer this instantly; the process walk below costs one
+    # CIM query per hop (~200ms each) and this chain is four deep.
     if ($env:WT_SESSION) { return @{ title = 'Terminal'; content = 'Windows Terminal' } }
     if ($env:TERM_PROGRAM -eq 'vscode') { return @{ title = 'Terminal'; content = 'Visual Studio Code' } }
     if ($env:ConEmuPID) { return @{ title = 'Terminal'; content = 'ConEmu' } }
     $programs = 'powershell', 'pwsh', 'winpty-agent', 'cmd', 'zsh', 'sh', 'bash', 'fish', 'env', 'nu', 'elvish', 'csh', 'tcsh', 'python', 'xonsh'
     if ($PSVersionTable.PSEdition.ToString() -ne 'Core') {
-        $parent = Get-Process -Id (Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $PID" -Property ParentProcessId).ParentProcessId -ErrorAction Ignore
+        $parent = Get-Process -Id (Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $PID" -Property ParentProcessId -CimSession $cimSession).ParentProcessId -ErrorAction Ignore
         for () {
             if ($parent.ProcessName -in $programs) {
-                $parent = Get-Process -Id (Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $($parent.ID)" -Property ParentProcessId).ParentProcessId -ErrorAction Ignore
+                $parent = Get-Process -Id (Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $($parent.ID)" -Property ParentProcessId -CimSession $cimSession).ParentProcessId -ErrorAction Ignore
                 continue
             }
             break
@@ -735,7 +735,7 @@ function info_cpu {
 function info_gpu {
     [System.Collections.ArrayList]$lines = @()
     #loop through Win32_VideoController
-    foreach ($gpu in Get-CimInstance -ClassName Win32_VideoController -Property Name) {
+    foreach ($gpu in Get-CimInstance -ClassName Win32_VideoController -Property Name -CimSession $cimSession) {
         [void]$lines.Add(@{
             title   = "GPU"
             content = $gpu.Name
